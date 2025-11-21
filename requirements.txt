@@ -1,0 +1,10 @@
+ultralytics==8.0.196
+easyocr
+opencv-python
+pillow
+numpy
+boto3
+fastapi
+uvicorn
+pytesseract
+python-multipart
