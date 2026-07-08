@@ -1,0 +1,24 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# AI Models
+models/
+
+# Test Images
+test_images/
+
+# Output
+output/
+results/
+logs/
+
+# VSCode
+.vscode/
+
+# Environment
+.env
