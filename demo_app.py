@@ -275,6 +275,7 @@ HTML_PAGE = """
           <th>매칭 결과</th>
           <th>점수</th>
           <th>페이싱</th>
+          <th>디버그: 인접 거리(px)</th>
         </tr>
       </thead>
       <tbody id="resultTableBody"></tbody>
@@ -366,12 +367,15 @@ function renderResult(data) {
     const matchCell = r.predicted_sku
       ? `<span class="badge-ok">✓ ${r.predicted_sku}</span> <span style="color:#888">(${r.brand}, ${r.spec})</span>`
       : `<span class="badge-fail">매칭 실패</span>`;
+    const nearestTag = (r.debug_nearest_tag_distance != null) ? r.debug_nearest_tag_distance : '-';
+    const nearbyList = (r.debug_nearby_candidate_distances || []).join(', ') || '-';
     tr.innerHTML = `
       <td>${r.price_text}</td>
       <td style="max-width:260px; word-break:break-all;">${r.matched_name_text || '<span style=\\'color:#bbb\\'>-</span>'}</td>
       <td>${matchCell}</td>
       <td>${r.match_score}</td>
       <td>${r.facing_count}</td>
+      <td style="font-size:11px; color:#888; max-width:180px;">옆 가격표까지 ${nearestTag}px<br>후보거리: ${nearbyList}</td>
     `;
     tbody.appendChild(tr);
   });

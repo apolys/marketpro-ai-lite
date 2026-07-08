@@ -35,6 +35,27 @@ def _distance(p1, p2):
     return ((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2) ** 0.5
 
 
+def _nearest_other_tag_distance(tag, all_tags):
+    """이 가격표와 '다른' 가격표들 사이의 최단 거리.
+    → 이 값이 실제 매대에서 가격표끼리 얼마나 촘촘한지를 보여주는 지표.
+    NAME_PROXIMITY_PX는 이 값보다 충분히 작아야 옆 제품 텍스트가 안 섞임."""
+    others = [t for t in all_tags if t is not tag]
+    if not others:
+        return None
+    return min(_distance(tag["center"], o["center"]) for o in others)
+
+
+def _nearby_candidate_distances(tag_center, name_candidates, limit=8, max_distance=2000):
+    """디버그용 — 이 가격표 기준 가까운 상품명 후보들까지의 실제 거리를 가까운 순으로 나열.
+    NAME_PROXIMITY_PX 값을 감으로 잡지 않고, 실제 이 숫자들을 보고 정하기 위한 용도."""
+    dists = sorted(
+        round(_distance(tag_center, c["center"]), 1)
+        for c in name_candidates
+        if _distance(tag_center, c["center"]) <= max_distance
+    )
+    return dists[:limit]
+
+
 def _gather_nearby_text(tag_center, name_candidates, max_distance=NAME_PROXIMITY_PX):
     """가격표 중심점 근처(max_distance 이내)의 텍스트들을 모아 하나의 문자열로 합침"""
     nearby = [c for c in name_candidates if _distance(tag_center, c["center"]) <= max_distance]
@@ -93,6 +114,14 @@ def match_sku(yolo_results, ocr_results, layout_type="A"):
 
         facing_count = _count_facing(tag["center"], tag["bbox"], yolo_results, layout_type)
 
+        # 🔍 디버그 전용 — NAME_PROXIMITY_PX(현재 값) 튜닝을 위한 실측 거리.
+        # nearest_tag_distance: 이 가격표와 가장 가까운 '다른' 가격표까지의 거리.
+        #   → NAME_PROXIMITY_PX가 이 값의 절반 정도보다 크면 옆 제품까지 끌어올 확률이 높음.
+        # nearby_candidate_distances: 실제 상품명 후보들까지의 거리를 가까운 순 8개.
+        #   → 그 사진에서 "우리 제품 텍스트"가 대략 몇 px 안쪽에 있는지 감을 잡는 용도.
+        debug_nearest_tag_distance = _nearest_other_tag_distance(tag, price_tags)
+        debug_nearby_candidate_distances = _nearby_candidate_distances(tag["center"], name_candidates)
+
         if best and best[1] >= MATCH_SCORE_THRESHOLD:
             catalog_idx = best[2]
             catalog_item = get_catalog_by_index(catalog_idx)
@@ -106,6 +135,8 @@ def match_sku(yolo_results, ocr_results, layout_type="A"):
                 "match_score": round(best[1], 1),
                 "facing_count": facing_count,
                 "layout_type": layout_type,
+                "debug_nearest_tag_distance": round(debug_nearest_tag_distance, 1) if debug_nearest_tag_distance else None,
+                "debug_nearby_candidate_distances": debug_nearby_candidate_distances,
             })
         else:
             # 매칭 실패 — 카탈로그에 없는 상품이거나 OCR 텍스트가 부족한 경우
@@ -117,6 +148,8 @@ def match_sku(yolo_results, ocr_results, layout_type="A"):
                 "facing_count": facing_count,
                 "layout_type": layout_type,
                 "note": "매칭 실패 — 카탈로그에 없거나 OCR 인식률 부족",
+                "debug_nearest_tag_distance": round(debug_nearest_tag_distance, 1) if debug_nearest_tag_distance else None,
+                "debug_nearby_candidate_distances": debug_nearby_candidate_distances,
             })
 
     return matches
