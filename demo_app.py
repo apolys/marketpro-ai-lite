@@ -100,6 +100,7 @@ async def analyze(
         "layout_type": layout_type,
         "image_size": list(img.size),
         "yolo_count": len(yolo_results),
+        "debug_yolo_labels": [d["label"] for d in yolo_results[:15]],  # 진단용 — 실제 어떤 라벨로 잡히는지 확인
         "price_tag_count": len(ocr_results["_blocks"]["price_tags"]),
         "name_candidate_count": len(ocr_results["_blocks"]["name_candidates"]),
         "banner_count": len(ocr_results["_blocks"]["filtered_banners"]),
@@ -265,6 +266,8 @@ HTML_PAGE = """
       <div class="stat"><div class="num" id="statRawOcr">-</div><div class="label">OCR 원시 텍스트 블록 (디버그)</div></div>
     </div>
 
+    <div id="yoloLabelsBox" style="font-size:12px; color:#666; margin-bottom:14px;"></div>
+
     <img id="annotatedImg">
 
     <table>
@@ -354,6 +357,12 @@ function renderResult(data) {
   document.getElementById('statBanner').textContent = data.banner_count;
   document.getElementById('statNameCand').textContent = data.name_candidate_count;
   document.getElementById('statRawOcr').textContent = data.debug_total_raw_blocks;
+
+  const yoloLabelsBox = document.getElementById('yoloLabelsBox');
+  const labels = data.debug_yolo_labels || [];
+  yoloLabelsBox.textContent = labels.length
+    ? ('YOLO 탐지 라벨(참고용, 상품명 아님): ' + labels.join(', '))
+    : 'YOLO 탐지 라벨 없음';
 
   const matched = data.sku_results.filter(r => r.predicted_sku).length;
   document.getElementById('statMatched').textContent = matched + ' / ' + data.sku_results.length;
