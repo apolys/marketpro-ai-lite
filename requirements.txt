@@ -1,4 +1,4 @@
-ultralytics==8.0.196
+ultralytics==8.4.90
 easyocr
 opencv-python
 pillow
@@ -8,3 +8,4 @@ fastapi
 uvicorn
 pytesseract
 python-multipart
+rapidfuzz
