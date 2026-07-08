@@ -279,6 +279,7 @@ HTML_PAGE = """
           <th>점수</th>
           <th>페이싱</th>
           <th>디버그: 인접 거리(px)</th>
+          <th>디버그: ROI 후보 수</th>
         </tr>
       </thead>
       <tbody id="resultTableBody"></tbody>
@@ -378,6 +379,8 @@ function renderResult(data) {
       : `<span class="badge-fail">매칭 실패</span>`;
     const nearestTag = (r.debug_nearest_tag_distance != null) ? r.debug_nearest_tag_distance : '-';
     const nearbyList = (r.debug_nearby_candidate_distances || []).join(', ') || '-';
+    const roiRaw = (r.debug_roi_raw_count != null) ? r.debug_roi_raw_count : '-';
+    const roiAfterQuality = (r.debug_roi_after_quality_count != null) ? r.debug_roi_after_quality_count : '-';
     tr.innerHTML = `
       <td>${r.price_text}</td>
       <td style="max-width:260px; word-break:break-all;">${r.matched_name_text || '<span style=\\'color:#bbb\\'>-</span>'}</td>
@@ -385,6 +388,7 @@ function renderResult(data) {
       <td>${r.match_score}</td>
       <td>${r.facing_count}</td>
       <td style="font-size:11px; color:#888; max-width:180px;">옆 가격표까지 ${nearestTag}px<br>후보거리: ${nearbyList}</td>
+      <td style="font-size:11px; color:#888;">ROI 안: ${roiRaw}개<br>품질필터 후: ${roiAfterQuality}개</td>
     `;
     tbody.appendChild(tr);
   });

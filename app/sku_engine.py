@@ -18,28 +18,34 @@ from rapidfuzz import process, fuzz
 from app.catalog_data import get_catalog_names, get_catalog_by_index
 from app.ocr_engine import MIN_CANDIDATE_QUALITY
 
-# 가격표 근처로 볼 최대 거리(픽셀). 이미지 해상도에 따라 조정 필요.
-# 2026.07.08: 실제 매대 사진(5712x4284 고해상도) 기준 진단 결과,
-# 가격표~상품명 사이 실측 거리가 400~1000px 수준으로 확인되어 값 상향 조정.
-# (참고: 원래 값 120은 저해상도 사진을 가정한 초기 추정치였음)
+# 2026.07.09 — ROI(관심영역) 기반 후보 추출로 구조 변경
 #
-# 2026.07.09 (라면 매대 실측 디버그 결과 반영, 실험 단계):
-#   debug_nearest_tag_distance / debug_nearby_candidate_distances로 실측한 결과,
-#   가격표끼리는 800~1900px로 그리 안 촘촘했지만, 가격표 하나 주변 60~400px
-#   반경 안에도 후보 텍스트가 8개씩 잡혀서(브랜드 로고, 프로모션 배너 문구,
-#   패키지 디자인 텍스트 등) 600px는 물론 훨씬 좁혀도 여러 개가 섞이는 게 확인됨.
-#   → 일단 150으로 낮춰서 "거리만 줄였을 때 개선 정도"를 실험 중.
+# 그동안 가격표를 중심으로 원형 반경(NAME_PROXIMITY_PX)을 그려서 그 안의 모든
+# 텍스트를 모으는 방식이었는데, 이 방식은 "방향" 구분이 없어서 가격표 좌우/아래에
+# 있는 옆 제품 텍스트까지 계속 끌어오는 근본적인 한계가 있었음. 600(2026.07.08)
+# → 150(2026.07.09)까지 낮춰본 실험 결과, 거리를 줄이면 잡음은 줄지만 진짜
+# 상품명 후보까지 같이 사라지는 경우가 확인되어 원형 반경 튜닝은 종료함.
 #
-#   ⚠️ 이 값은 최종값이 아님. 다음 단계로:
-#     1) OCR 후보 필터 추가 (배너/로고/패키지 텍스트를 애초에 name_candidates에서
-#        걸러내는 로직 — 거리만으로는 한계가 있다는 게 이번 실험으로 확인됨)
-#     2) YOLO 탐지 0건 원인 해결 (커스텀 학습 또는 대체 모델)
-#   최종적으로는 매장/매대 레이아웃마다 밀집도가 다르므로, 이 상수 하나에
-#   전역적으로 의존하는 구조에서 벗어나 카테고리/레이아웃별 동적 값 또는
-#   가격표-텍스트 그룹핑 알고리즘 자체를 개선하는 방향으로 가야 함.
+# → 상품명은 거의 항상 가격표 "위"에 인쇄되므로, 원이 아니라 가격표 위쪽으로만
+#   뻗은 직사각형 ROI를 먼저 잘라내고, 그 안에서만 후보를 본다.
+#   가격표 아래/옆은 처음부터 후보 대상에서 제외된다.
+#
+# ⚠️ 아래 두 값은 실측(400~1000px 범위)을 참고한 초기값이며 최종값이 아님.
+#    매장/매대 레이아웃마다 인쇄 위치가 다를 수 있으므로, 추후 실제 여러 매장
+#    데이터가 쌓이면 레이아웃별 동적 값으로 분리하는 것이 목표.
+ROI_ABOVE_PX = 300       # 가격표 위쪽 경계로부터 이 값(px)까지 위로 ROI 확장 (250~350 범위 중 중간값)
+ROI_HALF_WIDTH_PX = 150  # 가격표 좌우로 각각 이 값(px)까지 ROI 확장
+
+# 하위호환/디버그 비교용으로만 유지 — 실제 후보 수집(원형 반경 방식)에는 더 이상 사용하지 않음.
+# (ROI 방식으로 완전히 대체됨. _nearby_candidate_distances 등 디버그 함수에서만 참고용으로 사용)
 NAME_PROXIMITY_PX = 150
 
 # 페이싱 카운트 시 가격표 위쪽으로 몇 픽셀까지를 "같은 그룹"으로 볼지
+# ⚠️ 2026.07.09: YOLO 실험 종료 (COCO 0건, OIV7도 낱개 제품이 아닌 씬 전체를
+#    "Convenience store"로 뭉뚱그려 인식 — 매대 상품 단위 검출에는 범용 YOLO가
+#    부적합하다는 결론). 페이싱 카운트는 커스텀 학습 전까지 보류하고, 지금은
+#    OCR+가격표 기반 SKU 명 매칭 엔진 완성에 집중. 아래 상수/코드는 남겨두되
+#    당분간 facing_count는 0으로 나오는 게 정상임.
 FACING_SEARCH_HEIGHT_A = 220   # 평선반형: 바로 위 트레이 정도 범위
 FACING_SEARCH_HEIGHT_B = 400   # 바구니형: 바구니 안 전체를 보려면 더 넓게 잡음
 
@@ -76,32 +82,59 @@ def _nearby_candidate_distances(tag_center, name_candidates, limit=8, max_distan
     return dists[:limit]
 
 
-def _gather_nearby_text(tag_center, name_candidates, max_distance=NAME_PROXIMITY_PX):
+def _in_price_tag_roi(tag_bbox, candidate_center):
     """
-    가격표 중심점 근처의 텍스트를 모아 하나의 문자열로 합침.
+    가격표 Bounding Box 기준 '위쪽 직사각형 ROI' 안에 후보 중심점이 있는지 판정.
+    가격표 아래/좌우 바깥 텍스트는 이 함수 단계에서 원천적으로 제외된다.
 
-    2026.07.09 변경: NAME_PROXIMITY_PX를 150까지 낮춰본 실험 결과, 거리만으로는
-    "잡음이 섞이는 문제"만 줄고 "그 자리 텍스트 자체가 쓰레기인 문제"는 해결이
-    안 되는 것으로 확인됨. → 순서를 바꿔서 품질 필터를 먼저 적용하고,
-    그 다음에만 거리 계산을 수행한다. (ocr_engine.score_candidate_quality 참고)
+    ROI 정의:
+      - 세로: 가격표 위쪽 경계(tag_y_min)로부터 ROI_ABOVE_PX만큼 위 ~ 가격표 위쪽 경계까지
+        (가격표 자체 높이 영역 및 그 아래는 제외)
+      - 가로: 가격표 좌우 경계에서 각각 ROI_HALF_WIDTH_PX만큼 확장
     """
-    # 1) 품질 필터 먼저 — quality_score가 낮은 후보(배너/로고/OCR 오독 등)는
-    #    거리 계산 대상에서 아예 제외한다.
+    tag_x_min = min(p[0] for p in tag_bbox)
+    tag_x_max = max(p[0] for p in tag_bbox)
+    tag_y_min = min(p[1] for p in tag_bbox)  # 가격표 박스의 "위쪽" 경계 (이미지 좌표계는 아래로 갈수록 y 증가)
+
+    cx, cy = candidate_center
+
+    roi_x_min = tag_x_min - ROI_HALF_WIDTH_PX
+    roi_x_max = tag_x_max + ROI_HALF_WIDTH_PX
+    roi_y_min = tag_y_min - ROI_ABOVE_PX
+    roi_y_max = tag_y_min
+
+    return (roi_x_min <= cx <= roi_x_max) and (roi_y_min <= cy <= roi_y_max)
+
+
+def _gather_nearby_text(tag_bbox, tag_center, name_candidates, max_distance=NAME_PROXIMITY_PX):
+    """
+    가격표 기준 ROI(위쪽 직사각형 영역) 안의 텍스트만 모아 하나의 문자열로 합침.
+
+    구조 (2026.07.09 변경 — 원형 반경 방식 폐기):
+      가격표 ROI 추출 → 품질 필터(quality_score) → ROI 내부 거리순 정렬 → 조합
+
+    이전에는 가격표를 중심으로 원형 반경(NAME_PROXIMITY_PX) 안의 모든 텍스트를
+    모았는데, "방향" 구분이 없어 가격표 아래/옆 텍스트까지 계속 섞여 들어왔음.
+    상품명은 거의 항상 가격표 "위"에 인쇄되므로, 먼저 위쪽 ROI로 후보 자체를
+    좁혀서(옆/아래 텍스트는 원천 배제) 잡음을 구조적으로 줄인다.
+    """
+    # 1) ROI 추출 — 가격표 위쪽 직사각형 영역 안에 있는 후보만 남긴다.
+    #    (아래/좌우 바깥 텍스트는 이 단계에서 이미 제외됨)
+    in_roi = [c for c in name_candidates if _in_price_tag_roi(tag_bbox, c["center"])]
+
+    # 2) 품질 필터 — ROI 안에서도 배너/로고/OCR 오독 후보는 제외
     quality_filtered = [
-        c for c in name_candidates
+        c for c in in_roi
         if c.get("quality_score", 1.0) >= MIN_CANDIDATE_QUALITY
     ]
 
-    # 2) 필터를 통과한 후보 중에서만 거리 계산
-    nearby = [c for c in quality_filtered if _distance(tag_center, c["center"]) <= max_distance]
-
-    # 3) 그래도 여러 개 남으면 가까운 순으로 최대 MAX_CANDIDATES_PER_TAG개만 채택
-    nearby.sort(key=lambda c: _distance(tag_center, c["center"]))
-    nearby = nearby[:MAX_CANDIDATES_PER_TAG]
+    # 3) ROI 내부에서만 거리 계산 — 가까운 순으로 최대 MAX_CANDIDATES_PER_TAG개만 채택
+    quality_filtered.sort(key=lambda c: _distance(tag_center, c["center"]))
+    selected = quality_filtered[:MAX_CANDIDATES_PER_TAG]
 
     # 4) 최종 조합은 읽는 순서(위→아래)로 다시 정렬해서 합침 (상품명이 보통 가격 위에 인쇄됨)
-    nearby.sort(key=lambda c: c["center"][1])
-    return " ".join(c["text"] for c in nearby), nearby
+    selected.sort(key=lambda c: c["center"][1])
+    return " ".join(c["text"] for c in selected), selected
 
 
 def _count_facing(tag_center, tag_bbox, yolo_results, layout_type):
@@ -144,7 +177,11 @@ def match_sku(yolo_results, ocr_results, layout_type="A"):
     matches = []
 
     for tag in price_tags:
-        combined_text, nearby_texts = _gather_nearby_text(tag["center"], name_candidates)
+        combined_text, nearby_texts = _gather_nearby_text(tag["bbox"], tag["center"], name_candidates)
+
+        # 🔍 디버그 전용 — ROI 방식이 실제로 후보를 얼마나 좁히는지 확인용
+        debug_roi_raw_count = sum(1 for c in name_candidates if _in_price_tag_roi(tag["bbox"], c["center"]))
+        debug_roi_after_quality_count = len(nearby_texts)
 
         if combined_text.strip():
             catalog_names = get_catalog_names()
@@ -177,6 +214,8 @@ def match_sku(yolo_results, ocr_results, layout_type="A"):
                 "layout_type": layout_type,
                 "debug_nearest_tag_distance": round(debug_nearest_tag_distance, 1) if debug_nearest_tag_distance else None,
                 "debug_nearby_candidate_distances": debug_nearby_candidate_distances,
+                "debug_roi_raw_count": debug_roi_raw_count,
+                "debug_roi_after_quality_count": debug_roi_after_quality_count,
             })
         else:
             # 매칭 실패 — 카탈로그에 없는 상품이거나 OCR 텍스트가 부족한 경우
@@ -190,6 +229,8 @@ def match_sku(yolo_results, ocr_results, layout_type="A"):
                 "note": "매칭 실패 — 카탈로그에 없거나 OCR 인식률 부족",
                 "debug_nearest_tag_distance": round(debug_nearest_tag_distance, 1) if debug_nearest_tag_distance else None,
                 "debug_nearby_candidate_distances": debug_nearby_candidate_distances,
+                "debug_roi_raw_count": debug_roi_raw_count,
+                "debug_roi_after_quality_count": debug_roi_after_quality_count,
             })
 
     return matches
