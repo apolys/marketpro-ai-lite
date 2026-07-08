@@ -16,6 +16,7 @@
 
 from rapidfuzz import process, fuzz
 from app.catalog_data import get_catalog_names, get_catalog_by_index
+from app.ocr_engine import MIN_CANDIDATE_QUALITY
 
 # 가격표 근처로 볼 최대 거리(픽셀). 이미지 해상도에 따라 조정 필요.
 # 2026.07.08: 실제 매대 사진(5712x4284 고해상도) 기준 진단 결과,
@@ -45,6 +46,10 @@ FACING_SEARCH_HEIGHT_B = 400   # 바구니형: 바구니 안 전체를 보려면
 # 카탈로그 매칭 최소 신뢰도 (이 이하면 "매칭 실패"로 처리)
 MATCH_SCORE_THRESHOLD = 55
 
+# 품질 필터를 통과한 후보 중에서도, 가까운 순으로 최대 이 개수까지만 합쳐서 매칭에 사용
+# (필터를 통과해도 여러 개가 남을 수 있으므로 최종 안전장치로 둠)
+MAX_CANDIDATES_PER_TAG = 3
+
 
 def _distance(p1, p2):
     return ((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2) ** 0.5
@@ -72,9 +77,29 @@ def _nearby_candidate_distances(tag_center, name_candidates, limit=8, max_distan
 
 
 def _gather_nearby_text(tag_center, name_candidates, max_distance=NAME_PROXIMITY_PX):
-    """가격표 중심점 근처(max_distance 이내)의 텍스트들을 모아 하나의 문자열로 합침"""
-    nearby = [c for c in name_candidates if _distance(tag_center, c["center"]) <= max_distance]
-    # 위쪽에 있는 텍스트를 먼저 오도록 y좌표 기준 정렬 (보통 상품명이 가격 위에 인쇄됨)
+    """
+    가격표 중심점 근처의 텍스트를 모아 하나의 문자열로 합침.
+
+    2026.07.09 변경: NAME_PROXIMITY_PX를 150까지 낮춰본 실험 결과, 거리만으로는
+    "잡음이 섞이는 문제"만 줄고 "그 자리 텍스트 자체가 쓰레기인 문제"는 해결이
+    안 되는 것으로 확인됨. → 순서를 바꿔서 품질 필터를 먼저 적용하고,
+    그 다음에만 거리 계산을 수행한다. (ocr_engine.score_candidate_quality 참고)
+    """
+    # 1) 품질 필터 먼저 — quality_score가 낮은 후보(배너/로고/OCR 오독 등)는
+    #    거리 계산 대상에서 아예 제외한다.
+    quality_filtered = [
+        c for c in name_candidates
+        if c.get("quality_score", 1.0) >= MIN_CANDIDATE_QUALITY
+    ]
+
+    # 2) 필터를 통과한 후보 중에서만 거리 계산
+    nearby = [c for c in quality_filtered if _distance(tag_center, c["center"]) <= max_distance]
+
+    # 3) 그래도 여러 개 남으면 가까운 순으로 최대 MAX_CANDIDATES_PER_TAG개만 채택
+    nearby.sort(key=lambda c: _distance(tag_center, c["center"]))
+    nearby = nearby[:MAX_CANDIDATES_PER_TAG]
+
+    # 4) 최종 조합은 읽는 순서(위→아래)로 다시 정렬해서 합침 (상품명이 보통 가격 위에 인쇄됨)
     nearby.sort(key=lambda c: c["center"][1])
     return " ".join(c["text"] for c in nearby), nearby
 

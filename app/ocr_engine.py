@@ -12,11 +12,15 @@
 #         "raw_text": str,
 #         "detected_numbers": [str, ...],
 #         "_blocks": {
-#           "price_tags": [ {"text": str, "bbox": [[x,y],...], "center": (x,y)}, ... ],
-#           "name_candidates": [ 위와 동일 형식, ... ],
+#           "price_tags": [ {"text": str, "bbox": [[x,y],...], "center": (x,y),
+#                             "confidence": float}, ... ],
+#           "name_candidates": [ 위 + "quality_score": float(0~1) 추가, ... ],
 #           "filtered_banners": [ {"text": str, "bbox": [[x,y],...]}, ... ],
 #         }
 #       }
+#     (2026.07.09: confidence/quality_score는 계약 외 추가 필드 — 기존 소비자는
+#      이 키를 안 쓰므로 무해하지만, sku_engine.py는 이제부터 quality_score를
+#      필수로 사용함. 엔진 교체 시 quality_score도 반드시 함께 채워줄 것.)
 #   - 엔진 교체 시 extract_text_blocks() 내부만 다시 구현하고, 위 반환 형식은 그대로 유지할 것.
 #
 # 이전 버전 대비 변경점:
@@ -35,6 +39,24 @@ reader = easyocr.Reader(['en', 'ko'], gpu=False)
 PRICE_PATTERN = re.compile(r"\d{1,3}(,\d{3})+")          # 예: 9,990 / 11,880
 DATE_PATTERN = re.compile(r"^\d{8}$")                      # 예: 20260702
 SPEC_PATTERN = re.compile(r"\d+\s*(g|kg|ml|G|KG|ML)\b")   # 예: 800g, 1kg
+
+# 2026.07.09 — OCR 후보 품질 필터 (거리 계산 이전 단계)
+# NAME_PROXIMITY_PX(sku_engine.py)를 150까지 낮춰본 실험 결과, 거리만 줄여서는
+# "잡음이 섞이는 문제"만 줄어들 뿐 "그 자리에 있는 텍스트 자체가 쓰레기이거나
+# 아예 없는 문제"는 해결이 안 되는 것으로 확인됨 (라면 매대 실측 테스트, 2026.07.09).
+# → 거리 계산 전에 후보 텍스트 자체의 "진짜 상품명일 가능성"을 먼저 점수화해서 거른다.
+#
+# ⚠️ 아래 BANNER_PHRASES는 이번에 관찰된 잡음 문구를 하드코딩한 임시 블록리스트임.
+#    매장이 늘어날수록 계속 문구를 추가해줘야 하는 구조적 한계가 있으므로,
+#    장기적으로는 YOLO로 매대(진열 영역) 자체를 먼저 크롭해서 천장 배너/POP을
+#    원천적으로 OCR 대상에서 제외하는 방향(우선순위 2번 과제)이 근본 해결책임.
+BANNER_PHRASES = {
+    "롯데마트", "이마트", "전문", "세프가", "셰프가", "만든", "간편식",
+    "브랜드", "브래드", "요리하다", "오리하다", "행사상품", "신상품",
+}
+
+# 이 점수(0~1) 미만인 후보는 상품명 후보에서 제외 (sku_engine.py에서 사용)
+MIN_CANDIDATE_QUALITY = 0.35
 
 # 대형 프로모션 배너 판별 기준: 텍스트 박스 높이가 이미지 전체 높이의 이 비율보다 크면 배너로 간주
 BANNER_HEIGHT_RATIO = 0.12
@@ -74,6 +96,65 @@ def _bbox_center(bbox):
     xs = [p[0] for p in bbox]
     ys = [p[1] for p in bbox]
     return (sum(xs) / len(xs), sum(ys) / len(ys))
+
+
+def _text_composition(text):
+    """공백을 제외한 글자 구성 비율(한글/숫자/영문)을 계산."""
+    chars = [c for c in text if not c.isspace()]
+    total = len(chars) or 1
+    hangul = sum(1 for c in chars if '\uac00' <= c <= '\ud7a3')
+    digit = sum(1 for c in chars if c.isdigit())
+    latin = sum(1 for c in chars if c.isalpha() and c.isascii())
+    return {
+        "total": total,
+        "hangul_ratio": hangul / total,
+        "digit_ratio": digit / total,
+        "latin_ratio": latin / total,
+    }
+
+
+def score_candidate_quality(text, confidence=1.0):
+    """
+    OCR 후보 텍스트가 '진짜 상품명일 가능성'을 0~1 점수로 반환.
+    거리 계산(sku_engine._gather_nearby_text) 이전에 먼저 적용되는 필터용 점수.
+
+    조합 기준 (요청 반영):
+      1. 한글 비율 — 높을수록 가점
+      2. 숫자 비율 — 순수 숫자(브랜드 연도/코드 등)는 즉시 0점
+      3. 영어 비율 — 높을수록 감점
+      4. 배너/POP 문구 블록리스트 — 포함 시 즉시 0점
+      5. 최소 글자수 — 2글자 미만은 즉시 0점
+      6. OCR confidence — 그대로 가중 반영
+    """
+    clean = text.strip()
+    if not clean:
+        return 0.0
+
+    # 4) 배너/POP 문구 블록리스트: 부분 일치만 되어도 배너로 간주하고 탈락
+    for phrase in BANNER_PHRASES:
+        if phrase in clean:
+            return 0.0
+
+    comp = _text_composition(clean)
+
+    # 5) 최소 글자수
+    if comp["total"] < 2:
+        return 0.0
+
+    # 2) 순수 숫자만인 후보 (콤마가 없어 가격표로도 못 잡히고 남은 것들 —
+    #    "1963" 같은 브랜드 연도, 진열대 코드 등일 확률이 높음)
+    if comp["digit_ratio"] == 1.0:
+        return 0.0
+
+    score = 0.0
+    # 1) 한글 비율 가점 (카탈로그 상품명이 전부 한글이므로 가장 큰 가중치)
+    score += comp["hangul_ratio"] * 0.5
+    # 3) 영어 비율 감점 (한글 매대에서 순수 영문 토큰은 대개 OCR 오독/로고 파편)
+    score += (1 - comp["latin_ratio"]) * 0.2
+    # 6) OCR 자체 confidence 반영
+    score += confidence * 0.3
+
+    return round(min(score, 1.0), 3)
 
 
 def extract_text_blocks(pil_img):
@@ -120,13 +201,20 @@ def extract_text_blocks(pil_img):
             continue
 
         if PRICE_PATTERN.search(clean_text):
-            price_tags.append({"text": clean_text, "bbox": bbox, "center": center})
+            price_tags.append({"text": clean_text, "bbox": bbox, "center": center, "confidence": round(float(conf), 3)})
         elif DATE_PATTERN.match(clean_text.replace("-", "").replace(".", "")):
             # 날짜류는 상품명 후보에서도 제외 (가격표 안의 판매기간 텍스트 등)
             continue
         else:
             # 규격(중량) 텍스트도 상품명 후보에 포함 — SKU 매칭 시 참고 정보로 활용
-            name_candidates.append({"text": clean_text, "bbox": bbox, "center": center})
+            # quality_score: 거리 계산 전에 sku_engine에서 먼저 필터링하는 용도로 미리 계산해둠
+            name_candidates.append({
+                "text": clean_text,
+                "bbox": bbox,
+                "center": center,
+                "confidence": round(float(conf), 3),
+                "quality_score": score_candidate_quality(clean_text, conf),
+            })
 
     return {
         "price_tags": price_tags,
