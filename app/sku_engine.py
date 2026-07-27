@@ -15,6 +15,7 @@
 # ============================================
 
 from rapidfuzz import process, fuzz
+import re
 from app.catalog_data import get_catalog_names, get_catalog_by_index
 from app.ocr_engine import MIN_CANDIDATE_QUALITY
 
@@ -49,6 +50,20 @@ NAME_PROXIMITY_PX = 150
 FACING_SEARCH_HEIGHT_A = 220   # 평선반형: 바로 위 트레이 정도 범위
 FACING_SEARCH_HEIGHT_B = 400   # 바구니형: 바구니 안 전체를 보려면 더 넓게 잡음
 
+# ── 2026.07.27 스케일링 시도 2건 모두 롤백 ──────────────────────────
+# 1차: 이미지 전체 크기 기준 스케일링 → 2차: 가격표(tag_bbox) 크기 기준
+# 스케일링, 둘 다 시도했으나 실제 ocr_engine.py의 tag_bbox가 정확히 어떤
+# 영역(가격표 전체 카드인지, 숫자 텍스트만의 좁은 박스인지)을 가리키는지
+# 확인 없이 추측으로 기준값을 잡아 오히려 ROI가 0으로 붕괴하는 등 결과가
+# 더 나빠짐(2026.07.27). 근본 원인 파악 전까지는 원래 안정적으로 동작하던
+# 절대 픽셀 고정값(ROI_ABOVE_PX/ROI_HALF_WIDTH_PX)으로 되돌린다.
+#
+# 재시도 시 선행 조건: ocr_engine.py에서 실제 tag["bbox"]가 어느 영역을
+# 가리키는지(가격표 카드 전체 vs 숫자 텍스트만) 먼저 확인하고, 여러 해상도/
+# 촬영거리의 실사 사진으로 tag_bbox 크기 분포를 실측한 뒤 스케일링을
+# 재설계할 것. 지금처럼 추측치로 기준값을 잡지 말 것.
+# ──────────────────────────────────────────────────────────────
+
 # 카탈로그 매칭 최소 신뢰도 (이 이하면 "매칭 실패"로 처리)
 MATCH_SCORE_THRESHOLD = 55
 
@@ -63,6 +78,50 @@ MAX_CANDIDATES_PER_TAG = 3
 
 def _distance(p1, p2):
     return ((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2) ** 0.5
+
+
+# ── 2026.07.27 추가 ──────────────────────────────────────────────
+# 한 물리적 ESL(전자가격표)에 "1개 구매 시 가격"과 "N개 이상 구매 시 가격"이
+# 함께 인쇄되어 있는 경우(예: 삼양1963 6,150원/5,535원)를 OCR이 별도 텍스트
+# 블록 2개로 인식하는 케이스가 확인됨. 매칭 결과만으로는 어느 게 단품가인지
+# 멀티바이가인지 구분이 안 되므로, 인식된 가격 숫자를 카탈로그의
+# price(단품가)/multi_buy_price(N개이상가)와 비교해 태깅한다.
+def _parse_price(text):
+    """가격표 텍스트에서 숫자만 뽑아 정수로 변환. 숫자가 없으면 None."""
+    digits = re.sub(r"[^0-9]", "", text or "")
+    return int(digits) if digits else None
+
+
+def _price_tier(observed_price, catalog_item):
+    """observed_price가 catalog_item의 단품가/멀티바이가 중 어디에 해당하는지 판정.
+
+    두 값 다 있고 정확히 일치하면 확정 라벨을 반환하고, 정확히 일치하지
+    않으면(OCR 숫자 오독 등) 더 가까운 쪽에 '(추정)' 표시를 붙여 반환한다.
+    카탈로그에 가격 정보 자체가 없는 구 스키마 항목은 None을 반환한다.
+    """
+    if observed_price is None:
+        return None
+
+    single = catalog_item.get("price")
+    multi = catalog_item.get("multi_buy_price")
+    multi_qty = catalog_item.get("multi_buy_qty") or 2
+
+    if single is None and multi is None:
+        return None
+
+    if single is not None and observed_price == single:
+        return "단품가"
+    if multi is not None and observed_price == multi:
+        return f"{multi_qty}개이상가"
+
+    candidates = []
+    if single is not None:
+        candidates.append(("단품가", abs(observed_price - single)))
+    if multi is not None:
+        candidates.append((f"{multi_qty}개이상가", abs(observed_price - multi)))
+    candidates.sort(key=lambda x: x[1])
+    return f"{candidates[0][0]}(추정)"
+# ──────────────────────────────────────────────────────────────
 
 
 def _nearest_other_tag_distance(tag, all_tags):
@@ -107,15 +166,19 @@ def _match_catalog(combined_text, catalog_names):
     return best_overall
 
 
-def _in_price_tag_roi(tag_bbox, candidate_center):
+def _in_price_tag_roi(tag_bbox, candidate_center, roi_above_px=ROI_ABOVE_PX, roi_half_width_px=ROI_HALF_WIDTH_PX):
     """
     가격표 Bounding Box 기준 '위쪽 직사각형 ROI' 안에 후보 중심점이 있는지 판정.
     가격표 아래/좌우 바깥 텍스트는 이 함수 단계에서 원천적으로 제외된다.
 
+    2026.07.27: roi_above_px/roi_half_width_px를 인자로 받도록 변경 —
+    이미지 해상도에 비례해 스케일링된 값을 넘길 수 있게 하기 위함
+    (호출부에서 값을 안 넘기면 기존 절대 픽셀값 그대로 동작, 하위호환).
+
     ROI 정의:
-      - 세로: 가격표 위쪽 경계(tag_y_min)로부터 ROI_ABOVE_PX만큼 위 ~ 가격표 위쪽 경계까지
+      - 세로: 가격표 위쪽 경계(tag_y_min)로부터 roi_above_px만큼 위 ~ 가격표 위쪽 경계까지
         (가격표 자체 높이 영역 및 그 아래는 제외)
-      - 가로: 가격표 좌우 경계에서 각각 ROI_HALF_WIDTH_PX만큼 확장
+      - 가로: 가격표 좌우 경계에서 각각 roi_half_width_px만큼 확장
     """
     tag_x_min = min(p[0] for p in tag_bbox)
     tag_x_max = max(p[0] for p in tag_bbox)
@@ -123,15 +186,16 @@ def _in_price_tag_roi(tag_bbox, candidate_center):
 
     cx, cy = candidate_center
 
-    roi_x_min = tag_x_min - ROI_HALF_WIDTH_PX
-    roi_x_max = tag_x_max + ROI_HALF_WIDTH_PX
-    roi_y_min = tag_y_min - ROI_ABOVE_PX
+    roi_x_min = tag_x_min - roi_half_width_px
+    roi_x_max = tag_x_max + roi_half_width_px
+    roi_y_min = tag_y_min - roi_above_px
     roi_y_max = tag_y_min
 
     return (roi_x_min <= cx <= roi_x_max) and (roi_y_min <= cy <= roi_y_max)
 
 
-def _gather_nearby_text(tag_bbox, tag_center, name_candidates, max_distance=NAME_PROXIMITY_PX):
+def _gather_nearby_text(tag_bbox, tag_center, name_candidates,
+                         roi_above_px=ROI_ABOVE_PX, roi_half_width_px=ROI_HALF_WIDTH_PX):
     """
     가격표 기준 ROI(위쪽 직사각형 영역) 안의 텍스트만 모아 하나의 문자열로 합침.
 
@@ -145,7 +209,7 @@ def _gather_nearby_text(tag_bbox, tag_center, name_candidates, max_distance=NAME
     """
     # 1) ROI 추출 — 가격표 위쪽 직사각형 영역 안에 있는 후보만 남긴다.
     #    (아래/좌우 바깥 텍스트는 이 단계에서 이미 제외됨)
-    in_roi = [c for c in name_candidates if _in_price_tag_roi(tag_bbox, c["center"])]
+    in_roi = [c for c in name_candidates if _in_price_tag_roi(tag_bbox, c["center"], roi_above_px, roi_half_width_px)]
 
     # 2) 품질 필터 — ROI 안에서도 배너/로고/OCR 오독 후보는 제외
     quality_filtered = [
@@ -183,7 +247,56 @@ def _count_facing(tag_center, tag_bbox, yolo_results, layout_type):
     return count
 
 
-def match_sku(yolo_results, ocr_results, layout_type="A"):
+# ── 2026.07.27 추가 ──────────────────────────────────────────────
+# 데모 페이지에서 "인식된 주변 텍스트"를 사람이 수동으로 고쳐서 즉시
+# 재매칭해볼 수 있게 하기 위한 공개 함수. OCR/ROI/이미지 재분석 없이,
+# 텍스트 하나만 받아서 카탈로그와 바로 매칭한다. 사진을 다시 찍거나
+# 파이프라인을 다시 돌리지 않고도 "이 텍스트였다면 매칭이 맞는지"를
+# 즉시 검증할 수 있다 (예: OCR이 깨뜨린 텍스트를 정답으로 고쳐서 확인).
+def match_catalog_text(combined_text):
+    """편집된 텍스트를 카탈로그와 직접 매칭. OCR/ROI 파이프라인과 무관하게
+    동작하며, match_sku()가 매칭 성공 시 반환하는 것과 동일한 필드 구성으로
+    결과를 반환한다."""
+    combined_text = (combined_text or "").strip()
+    if len(combined_text) < MIN_MATCH_TEXT_LENGTH:
+        return {
+            "matched_name_text": combined_text,
+            "predicted_sku": None,
+            "match_score": 0,
+            "note": "텍스트가 너무 짧습니다 (최소 길이 미달)",
+        }
+
+    catalog_names = get_catalog_names()
+    best = _match_catalog(combined_text, catalog_names)
+
+    if not best or best[1] < MATCH_SCORE_THRESHOLD:
+        return {
+            "matched_name_text": combined_text,
+            "predicted_sku": None,
+            "match_score": round(best[1], 1) if best else 0,
+            "note": "매칭 실패 — 카탈로그에 없거나 텍스트 유사도 부족",
+        }
+
+    catalog_item = get_catalog_by_index(best[2])
+    return {
+        "matched_name_text": combined_text,
+        "predicted_sku": catalog_item.get("sku") or catalog_item.get("sku_name"),
+        "brand": catalog_item.get("brand"),
+        "company": catalog_item.get("company"),
+        "product_group": catalog_item.get("product_group"),
+        "spec": catalog_item.get("spec") or catalog_item.get("ea"),
+        "storage_type": catalog_item.get("storage_type"),
+        "price": catalog_item.get("price"),
+        "multi_buy_price": catalog_item.get("multi_buy_price"),
+        "multi_buy_qty": catalog_item.get("multi_buy_qty"),
+        "discount_rate": catalog_item.get("discount_rate"),
+        "barcode": catalog_item.get("barcode"),
+        "match_score": round(best[1], 1),
+    }
+# ──────────────────────────────────────────────────────────────
+
+
+def match_sku(yolo_results, ocr_results, layout_type="A", image_size=None):
     """
     SKU 매칭 메인 함수
 
@@ -191,6 +304,11 @@ def match_sku(yolo_results, ocr_results, layout_type="A"):
         yolo_results: yolo_engine.detect_products()의 결과 (페이싱 카운트 보조용)
         ocr_results: ocr_engine.extract_price()의 결과 (내부에 _blocks로 좌표 포함)
         layout_type: "A" (평선반형) 또는 "B" (바구니형)
+        image_size: (width, height) — 진단 로그 출력용으로만 사용(참고용).
+            2026.07.27 해상도/촬영거리 대응 스케일링을 두 차례 시도했으나
+            (이미지 전체 크기 기준 → 가격표 크기 기준) 둘 다 tag_bbox의
+            실제 의미를 확인 안 한 추측이라 결과가 악화되어 전부 롤백함.
+            ROI는 다시 절대 픽셀 고정값(ROI_ABOVE_PX/ROI_HALF_WIDTH_PX)을 사용.
 
     Returns:
         가격표별 매칭 결과 리스트
@@ -198,6 +316,20 @@ def match_sku(yolo_results, ocr_results, layout_type="A"):
     blocks = ocr_results.get("_blocks", {"price_tags": [], "name_candidates": []})
     price_tags = blocks["price_tags"]
     name_candidates = blocks["name_candidates"]
+
+    # 🔍 진단용 (2026.07.27) — "사진에 보이는 가격표 개수"와 "OCR이 실제로 검출한
+    # 가격표 개수"가 일치하는지 확인하기 위한 로그. 다른 개수라면 이후 매칭
+    # 이전 단계(OCR 가격표 검출 자체)에서 누락/가림이 있었다는 뜻이므로,
+    # 원인이 사진 촬영(가림)인지 코드(검출 로직)인지 구분하는 첫 단서가 된다.
+    # 확인이 끝나면 이 줄은 지워도 무방.
+    print(f"[진단] OCR이 검출한 가격표(price_tags) 개수: {len(price_tags)}")
+    print(f"[진단] image_size={image_size} (참고용)")
+    # 🔍 진단용 (2026.07.27) — 향후 해상도별 스케일링을 다시 시도하려면, 그 전에
+    # 반드시 이 로그로 실제 tag_bbox 크기 분포부터 실측해야 한다(추측 금지).
+    for _t in price_tags:
+        _xs = [p[0] for p in _t["bbox"]]
+        _ys = [p[1] for p in _t["bbox"]]
+        print(f"[진단] price_tag bbox 크기: 폭={max(_xs)-min(_xs):.1f}px, 높이={max(_ys)-min(_ys):.1f}px")
 
     matches = []
 
@@ -229,13 +361,27 @@ def match_sku(yolo_results, ocr_results, layout_type="A"):
         if best and best[1] >= MATCH_SCORE_THRESHOLD:
             catalog_idx = best[2]
             catalog_item = get_catalog_by_index(catalog_idx)
+            observed_price = _parse_price(tag["text"])
             matches.append({
                 "price_text": tag["text"],
                 "matched_name_text": combined_text,
-                "predicted_sku": catalog_item["sku_name"],
-                "brand": catalog_item["brand"],
-                "spec": catalog_item["spec"],
-                "storage_type": catalog_item["storage_type"],
+                # 기존 필드 — demo_app.py 렌더링과의 호환을 위해 키 이름/의미 유지
+                "predicted_sku": catalog_item.get("sku") or catalog_item.get("sku_name"),
+                "brand": catalog_item.get("brand"),
+                "spec": catalog_item.get("spec") or catalog_item.get("ea"),
+                "storage_type": catalog_item.get("storage_type"),
+                # 신규 필드 — 2026.07.27 카탈로그 스키마 확장분 (company/가격/멀티바이/바코드)
+                # 구 스키마 항목(신선육/냉동 등)은 해당 키가 없으므로 None으로 채워짐
+                "company": catalog_item.get("company"),
+                "product_group": catalog_item.get("product_group"),
+                "price": catalog_item.get("price"),
+                "multi_buy_price": catalog_item.get("multi_buy_price"),
+                "multi_buy_qty": catalog_item.get("multi_buy_qty"),
+                "discount_rate": catalog_item.get("discount_rate"),
+                "barcode": catalog_item.get("barcode"),
+                # 2026.07.27 추가 — 이 가격표가 단품가인지 N개이상가인지 구분
+                "observed_price": observed_price,
+                "price_tier": _price_tier(observed_price, catalog_item),
                 "match_score": round(best[1], 1),
                 "facing_count": facing_count,
                 "layout_type": layout_type,

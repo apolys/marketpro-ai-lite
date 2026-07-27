@@ -26,7 +26,7 @@ from PIL import Image, ImageDraw, ImageOps
 
 from app.yolo_engine import detect_products
 from app.ocr_engine import extract_price
-from app.sku_engine import match_sku
+from app.sku_engine import match_sku, match_catalog_text
 
 app = FastAPI(title="MarketPro AI Lite - 로컬 데모")
 
@@ -74,6 +74,13 @@ def index():
     return HTML_PAGE
 
 
+@app.post("/api/rematch")
+async def rematch(text: str = Form(...)):
+    """OCR/이미지 재분석 없이, 사람이 수정한 텍스트를 카탈로그와 바로 재매칭.
+    2026.07.27 추가 — 인식된 텍스트를 데모 화면에서 직접 편집해 재매칭해볼 수
+    있게 하기 위함 (예: OCR이 깨뜨린 텍스트를 정답으로 고쳐서 매칭 로직만 검증)."""
+    result = match_catalog_text(text)
+    return JSONResponse(result)
 @app.post("/api/analyze")
 async def analyze(
     file: UploadFile = File(...),
@@ -91,7 +98,7 @@ async def analyze(
 
     yolo_results = detect_products(img)
     ocr_results = extract_price(img)
-    sku_results = match_sku(yolo_results, ocr_results, layout_type=layout_type)
+    sku_results = match_sku(yolo_results, ocr_results, layout_type=layout_type, image_size=img.size)
 
     annotated = _draw_annotations(img, ocr_results["_blocks"])
 
@@ -274,6 +281,7 @@ HTML_PAGE = """
       <thead>
         <tr>
           <th>가격</th>
+          <th>가격구분</th>
           <th>인식된 주변 텍스트</th>
           <th>매칭 결과</th>
           <th>점수</th>
@@ -284,6 +292,10 @@ HTML_PAGE = """
       </thead>
       <tbody id="resultTableBody"></tbody>
     </table>
+    <button id="addMissingBtn" type="button"
+            style="margin-top:14px; font-size:13px; padding:9px 14px; border-radius:8px; border:1px dashed var(--border); background:#fafafa; cursor:pointer; color:#555;">
+      + 누락 제품 추가 (사진에서 가려진 가격표 등)
+    </button>
   </div>
 </div>
 
@@ -372,29 +384,107 @@ function renderResult(data) {
 
   const tbody = document.getElementById('resultTableBody');
   tbody.innerHTML = '';
-  data.sku_results.forEach(r => {
+  data.sku_results.forEach((r) => {
     const tr = document.createElement('tr');
-    const matchCell = r.predicted_sku
+    const matchCellHtml = r.predicted_sku
       ? `<span class="badge-ok">✓ ${r.predicted_sku}</span> <span style="color:#888">(${r.brand}, ${r.spec})</span>`
       : `<span class="badge-fail">매칭 실패</span>`;
     const nearestTag = (r.debug_nearest_tag_distance != null) ? r.debug_nearest_tag_distance : '-';
     const nearbyList = (r.debug_nearby_candidate_distances || []).join(', ') || '-';
     const roiRaw = (r.debug_roi_raw_count != null) ? r.debug_roi_raw_count : '-';
     const roiAfterQuality = (r.debug_roi_after_quality_count != null) ? r.debug_roi_after_quality_count : '-';
+    const priceTier = r.price_tier || '-';
+    const safeText = (r.matched_name_text || '').replace(/"/g, '&quot;');
     tr.innerHTML = `
       <td>${r.price_text}</td>
-      <td style="max-width:260px; word-break:break-all;">${r.matched_name_text || '<span style=\\'color:#bbb\\'>-</span>'}</td>
-      <td>${matchCell}</td>
-      <td>${r.match_score}</td>
+      <td>${priceTier}</td>
+      <td style="max-width:220px;">
+        <input type="text" class="editText" value="${safeText}"
+               style="width:100%; font-size:12px; padding:5px 6px; border:1px solid var(--border); border-radius:6px; box-sizing:border-box;">
+        <button class="rematchBtn" type="button"
+                style="margin-top:5px; font-size:11px; padding:4px 9px; border-radius:6px; border:1px solid var(--border); background:#f5f5f5; cursor:pointer;">
+          ↻ 재매칭
+        </button>
+      </td>
+      <td class="matchCell">${matchCellHtml}</td>
+      <td class="scoreCell">${r.match_score}</td>
       <td>${r.facing_count}</td>
       <td style="font-size:11px; color:#888; max-width:180px;">옆 가격표까지 ${nearestTag}px<br>후보거리: ${nearbyList}</td>
       <td style="font-size:11px; color:#888;">ROI 안: ${roiRaw}개<br>품질필터 후: ${roiAfterQuality}개</td>
     `;
     tbody.appendChild(tr);
+    wireRematchButton(tr.querySelector('.rematchBtn'));
   });
 
   resultSection.style.display = 'block';
 }
+
+// 재매칭 버튼 — OCR/이미지 재분석 없이, 편집한 텍스트만으로 카탈로그 재매칭.
+// (2026.07.27 추가: 인식 텍스트를 사람이 고쳐서 매칭 로직만 바로 검증할 때 사용.
+//  같은 <tr> 안의 .editText/.matchCell/.scoreCell을 찾아 갱신하므로, 분석 결과
+//  행이든 아래 '누락 제품 추가'로 만든 새 행이든 동일하게 동작한다.)
+function wireRematchButton(btn) {
+  btn.addEventListener('click', async () => {
+    const tr = btn.closest('tr');
+    const input = tr.querySelector('.editText');
+    const text = input.value;
+    const matchCellEl = tr.querySelector('.matchCell');
+    const scoreCellEl = tr.querySelector('.scoreCell');
+
+    btn.disabled = true;
+    const originalLabel = btn.textContent;
+    btn.textContent = '...';
+    try {
+      const formData = new FormData();
+      formData.append('text', text);
+      const res = await fetch('/api/rematch', { method: 'POST', body: formData });
+      if (!res.ok) throw new Error('서버 오류: ' + res.status);
+      const result = await res.json();
+      matchCellEl.innerHTML = result.predicted_sku
+        ? `<span class="badge-ok">✓ ${result.predicted_sku}</span> <span style="color:#888">(${result.brand || '-'}, ${result.spec || '-'})</span>`
+        : `<span class="badge-fail">매칭 실패${result.note ? ' — ' + result.note : ''}</span>`;
+      scoreCellEl.textContent = result.match_score;
+    } catch (err) {
+      matchCellEl.innerHTML = `<span class="badge-fail">재매칭 오류: ${err.message}</span>`;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = originalLabel;
+    }
+  });
+}
+
+// 누락 제품 추가 — 사진에서 가격표 자체가 가려져 OCR이 아예 못 잡은 경우,
+// 빈 행을 하나 만들어서 사람이 직접 인식 텍스트(및 가격)를 입력하고
+// 재매칭해볼 수 있게 함. (2026.07.27 추가)
+document.getElementById('addMissingBtn').addEventListener('click', () => {
+  const tbody = document.getElementById('resultTableBody');
+  const tr = document.createElement('tr');
+  tr.innerHTML = `
+    <td>
+      <input type="text" class="editPriceText" placeholder="예: 6,600"
+             style="width:80px; font-size:12px; padding:5px 6px; border:1px solid var(--border); border-radius:6px; box-sizing:border-box;">
+    </td>
+    <td>-</td>
+    <td style="max-width:220px;">
+      <input type="text" class="editText" placeholder="예: 하림 더미식 장인라면 맵싸한맛"
+             style="width:100%; font-size:12px; padding:5px 6px; border:1px solid var(--border); border-radius:6px; box-sizing:border-box;">
+      <button class="rematchBtn" type="button"
+              style="margin-top:5px; font-size:11px; padding:4px 9px; border-radius:6px; border:1px solid var(--border); background:#f5f5f5; cursor:pointer;">
+        ↻ 재매칭
+      </button>
+    </td>
+    <td class="matchCell"><span class="badge-fail">-</span></td>
+    <td class="scoreCell">-</td>
+    <td>-</td>
+    <td style="font-size:11px; color:#888;">수동 추가 (사진에서 가려짐 등)</td>
+    <td>-</td>
+  `;
+  tbody.appendChild(tr);
+  wireRematchButton(tr.querySelector('.rematchBtn'));
+  tr.querySelector('.editText').focus();
+  // 결과 섹션이 아직 안 열려있으면(분석 전에 먼저 누른 경우) 열어준다
+  document.getElementById('resultSection').style.display = 'block';
+});
 </script>
 </body>
 </html>
