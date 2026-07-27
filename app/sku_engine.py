@@ -52,6 +52,10 @@ FACING_SEARCH_HEIGHT_B = 400   # 바구니형: 바구니 안 전체를 보려면
 # 카탈로그 매칭 최소 신뢰도 (이 이하면 "매칭 실패"로 처리)
 MATCH_SCORE_THRESHOLD = 55
 
+# 이 글자수 미만인 조합 텍스트는 카탈로그 매칭 시도 자체를 안 함
+# (너무 짧으면 rapidfuzz가 우연히 임계값 이상 점수를 주는 오탐이 확인됨, 2026.07.09)
+MIN_MATCH_TEXT_LENGTH = 3
+
 # 품질 필터를 통과한 후보 중에서도, 가까운 순으로 최대 이 개수까지만 합쳐서 매칭에 사용
 # (필터를 통과해도 여러 개가 남을 수 있으므로 최종 안전장치로 둠)
 MAX_CANDIDATES_PER_TAG = 3
@@ -80,6 +84,27 @@ def _nearby_candidate_distances(tag_center, name_candidates, limit=8, max_distan
         if _distance(tag_center, c["center"]) <= max_distance
     )
     return dists[:limit]
+
+
+def _match_catalog(combined_text, catalog_names):
+    """
+    카탈로그 매칭 — 여러 스코어러 중 최고점을 채택.
+
+    2026.07.09 (클로즈업 사진 테스트에서 발견): ROI+품질필터를 거쳐도, OCR이
+    정답 상품명을 정확히 읽었는데도 그 앞뒤에 다른 잡음 글자가 붙어있으면
+    (예: "'맨출m 추천 하림더미식 장인라면 업바라맛" 안에 "하림더미식 장인라면"이
+    정확히 들어있음) fuzz.WRatio 점수가 낮게 나오는 경우가 확인됨. WRatio는
+    전체 문자열 길이 대비 유사도라서, 짧은 정답이 긴 잡음 속에 파묻히면
+    불리해지는 구조적 특성 때문.
+    → partial_ratio(부분 문자열 정렬)와 token_set_ratio(토큰 집합 교집합)를
+      함께 계산해서, 잡음에 파묻힌 정답도 놓치지 않도록 셋 중 최고점을 채택.
+    """
+    best_overall = None
+    for scorer in (fuzz.WRatio, fuzz.partial_ratio, fuzz.token_set_ratio):
+        result = process.extractOne(combined_text, catalog_names, scorer=scorer)
+        if result and (best_overall is None or result[1] > best_overall[1]):
+            best_overall = result
+    return best_overall
 
 
 def _in_price_tag_roi(tag_bbox, candidate_center):
@@ -183,9 +208,11 @@ def match_sku(yolo_results, ocr_results, layout_type="A"):
         debug_roi_raw_count = sum(1 for c in name_candidates if _in_price_tag_roi(tag["bbox"], c["center"]))
         debug_roi_after_quality_count = len(nearby_texts)
 
-        if combined_text.strip():
+        # 2026.07.09: 너무 짧은 텍스트(예: "'이")는 rapidfuzz가 우연히 높은
+        # 점수(임계값 이상)를 줄 수 있음이 확인됨 — 애초에 매칭 시도 자체를 안 함.
+        if combined_text.strip() and len(combined_text.strip()) >= MIN_MATCH_TEXT_LENGTH:
             catalog_names = get_catalog_names()
-            best = process.extractOne(combined_text, catalog_names, scorer=fuzz.WRatio)
+            best = _match_catalog(combined_text, catalog_names)
         else:
             best = None
 

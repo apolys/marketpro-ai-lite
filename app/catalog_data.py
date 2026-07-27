@@ -69,6 +69,23 @@ CATALOG = [
      "sku_name": "안심꿔바로우", "spec": "450g", "storage_type": "냉동"},
     {"category": "냉동조리식품", "brand": "하림", "product_group": "순살치킨",
      "sku_name": "소이갈릭 순살치킨", "spec": "350g", "storage_type": "냉동"},
+
+    # ── 라면 (상온, 하림산업 더미식 — 실제 매대 사진 기준 핵심 SKU) ──
+    {"category": "라면", "brand": "하림산업", "product_group": "더미식 장인라면",
+     "sku_name": "더미식 장인라면 얼큰한맛", "spec": "5입", "storage_type": "상온"},
+    {"category": "라면", "brand": "하림산업", "product_group": "더미식 장인라면",
+     "sku_name": "더미식 장인라면 담백한맛", "spec": "5입", "storage_type": "상온"},
+
+    # ── 라면 (상온, 경쟁사 벤치마킹용 — 매대 동일 구역에 진열된 제품)
+    # ⚠️ 사진 속 라벨이 OCR로 흐릿하게만 확인되어 정확한 스펙은 검증 필요
+    {"category": "라면", "brand": "농심", "product_group": "신라면",
+     "sku_name": "신라면", "spec": "5입", "storage_type": "상온"},
+    {"category": "라면", "brand": "오뚜기", "product_group": "진라면",
+     "sku_name": "진라면 매운맛", "spec": "5입", "storage_type": "상온"},
+    {"category": "라면", "brand": "삼양식품", "product_group": "삼양라면",
+     "sku_name": "삼양라면", "spec": "5입", "storage_type": "상온"},
+    {"category": "라면", "brand": "팔도", "product_group": "팔도라면",
+     "sku_name": "서울라면", "spec": "5입", "storage_type": "상온"},
 ]
 
 
