@@ -285,7 +285,7 @@ HTML_PAGE = """
           <th>인식된 주변 텍스트</th>
           <th>매칭 결과</th>
           <th>점수</th>
-          <th>페이싱</th>
+          <th>페이싱<br><span style="font-weight:400; font-size:10px; color:#999;">(AI 미지원, 수동입력)</span></th>
           <th>디버그: 인접 거리(px)</th>
           <th>디버그: ROI 후보 수</th>
         </tr>
@@ -408,7 +408,10 @@ function renderResult(data) {
       </td>
       <td class="matchCell">${matchCellHtml}</td>
       <td class="scoreCell">${r.match_score}</td>
-      <td>${r.facing_count}</td>
+      <td>
+        <input type="number" min="0" class="editFacing" value="${r.facing_count || 0}"
+               style="width:52px; font-size:12px; padding:5px 6px; border:1px solid var(--border); border-radius:6px; text-align:center;">
+      </td>
       <td style="font-size:11px; color:#888; max-width:180px;">옆 가격표까지 ${nearestTag}px<br>후보거리: ${nearbyList}</td>
       <td style="font-size:11px; color:#888;">ROI 안: ${roiRaw}개<br>품질필터 후: ${roiAfterQuality}개</td>
     `;
@@ -475,7 +478,10 @@ document.getElementById('addMissingBtn').addEventListener('click', () => {
     </td>
     <td class="matchCell"><span class="badge-fail">-</span></td>
     <td class="scoreCell">-</td>
-    <td>-</td>
+    <td>
+      <input type="number" min="0" class="editFacing" value="0"
+             style="width:52px; font-size:12px; padding:5px 6px; border:1px solid var(--border); border-radius:6px; text-align:center;">
+    </td>
     <td style="font-size:11px; color:#888;">수동 추가 (사진에서 가려짐 등)</td>
     <td>-</td>
   `;
